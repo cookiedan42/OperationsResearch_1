@@ -4,6 +4,7 @@ import numpy as np
 from .Format import *
 
 class Constraint():
+    # unused
     def __init__(self):
         self.variables = variables  # 1d dataFrame
         self.sign = sign            # String
