@@ -1,0 +1,6 @@
+__pycache__/
+scratch/
+build/
+dist/
+*.egg-info/
+scratch.py
