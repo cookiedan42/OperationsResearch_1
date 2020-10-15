@@ -6,20 +6,39 @@ import unittest
 
 class BasicTestSuite(unittest.TestCase):
     """Basic test cases."""
-    def test_some(self):
+    def test_BFS(self):
         costs = [
             [6,7,8],
             [15,80,78]
             ]
-        col = [10,15]
-        row = [15,5,5]
-        t = OR.TransportTable.new(costs,col,row,colName="supply",rowName="demand")
+        RHS = [10,15]
+        BHS = [15,5,5]
+        t = OR.TransportTable.new(costs,RHS,BHS,RHSName="supply",BHSName="demand")
         t2 = t.northWest(echo=True)
         print("\n----------\n")
         t3 = t.minimumCost(echo=True)
         print("\n----------\n")
         t4 = t.vogel(echo=True)
-    def test_other(self):
+        print("\n----------\n")
+    def test_optimal(self):
+        costs = [
+            [8,6,10,9],
+            [9,12,13,7],
+            [14,9,16,5]
+            ]
+        RHS = [35,50,40]
+        BHS = [45,20,30,30]
+        
+        t = OR.TransportTable.new(costs,RHS,BHS,RHSName="supply",BHSName="demand")
+        print(t)
+        t4 = t.northWest(echo=True)
+        print(t4)
+        print("\n----------\n")
+        print(t4.to_LP())
+        print("\n----------\n")
+        print(t4.to_DualLP())
+        print("\n----------\n")
+        print(t4.getEnteringVar())
         pass
 if __name__ == '__main__':
     unittest.main()
