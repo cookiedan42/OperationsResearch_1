@@ -37,7 +37,9 @@ class LP():
         self.body = body                    # DataFrame
         self.signs = signs                  # List
 
-    def getDual(self,newFactorName = "Y"):
+    def getDual(self,factorPrefix = "Y",factorNames=[]):
+        #factorNames is some List /nparray?
+
         if self.objectiveType == "min":
             constraint_sign  = {">":">","=":"urs","<":"<"}
             variable_sign    = {">":"<","urs":"=","<":">"}
@@ -52,7 +54,12 @@ class LP():
         obj = body.iloc[:,-1:].T.drop(0,axis=1)
         mid = body.iloc[:,:-2].drop(0).T
         obj = obj.append(mid).reset_index().drop("index",axis=1)
-        obj.columns = [f"{newFactorName}{subscript(i)}" for i in obj.columns]
+        
+        if len(factorNames)== len(obj.columns):
+            obj.columns = factorNames
+        else:
+            obj.columns = [f"{factorPrefix}{subscript(i)}" for i in obj.columns]
+
         obj.insert(obj.shape[1],"signs",np.array([""] + [variable_sign[i] for i in signs]))
         obj.insert(obj.shape[1],"RHS",np.append([""],body.iloc[0,:-2]))
         
@@ -144,6 +151,5 @@ class LP():
         outDF = outDF.append(signsDF)
         outDF = outDF.reset_index().drop(["index"],axis=1)
         return outDF
-
     def __repr__(self):
         return str(self.display())
