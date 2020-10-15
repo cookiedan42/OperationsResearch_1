@@ -17,3 +17,4 @@ def displayHelper(item):
         display(item)
     except:
         print(item)
+        print()
