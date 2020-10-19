@@ -84,8 +84,17 @@ class Hungarian():
             rows = (workingDF == 0).astype(int).sum(axis=1)
             cols = (workingDF == 0).astype(int).sum(axis=0)
             max0 = max(rows.append(cols))
+        # if echo:
+        #     echoDisp = workingDF.copy()
+        #     for rowIndex in echoDisp.index:
+        #         for colIndex in echoDisp.columns:
+        #             if echoDisp.loc[rowIndex,colIndex] 
+        #       idea to do 
+        #       - for row only
+        #       | for col only
+        #       + for row and col
         
-        if echo:{displayHelper(workingDF)}
+        if echo:{displayHelper(workingDF.applymap(lambda x:"-" if np.isposinf(x) else x))}
         return workingDF
 
     def reduceDF(self,coveredDF,echo=False):
@@ -109,8 +118,8 @@ class Hungarian():
         '''
         return calculated objective value of this transport tableau using current assignments
         '''
-        if type(self.assignedDF) == bool:
-            return self.costDF.mul(self.assignDF).sum().sum()
+        if type(self.assignedDF) != bool:
+            return self.costDF.mul(self.assignedDF).sum().sum()
         else:
             raise ValueError("assignments have not been calculated")
 
