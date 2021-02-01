@@ -1,427 +1,380 @@
-from .Format import *
-from .LP import LP
 import numpy as np
 from pandas import DataFrame,Series
+import pandas as pd
+
+from .LP import LP
+from .ObjectiveFunction import ObjectiveFunction
+from .Constraint import Constraint
+from .NonNeg import NonNeg
+from .Format import Optimal, OptimalException
+
+from typing import List,Tuple,Dict,TypeVar
+TransportTable = TypeVar("TransportTable")
 
 class TransportTable():
+
     @classmethod
-    #factory to produce BFS-less tptTable
-    def new(cls,costs,RHS,BHS,RHSName = "RHS",BHSName = "BHS"):
-        costDF = DataFrame(costs).copy()
-        costDF.columns = [i+1 for i in range(len(costDF.columns))]
-        costDF.index = [i+1 for i in range(len(costDF.index))]
-        
-        RHS = Series(RHS,name=RHSName).copy()
-        RHS.index = [i+1 for i in range(len(RHS.index))]
-        BHS = Series(BHS,name=BHSName).copy()
-        BHS.index = [i+1 for i in range(len(BHS.index))]
-        BFS = dict()
-        return TransportTable(costDF,BFS,RHS,BHS)
+    def new(cls,inArray:List[List[float]]) -> TransportTable:
+        '''
+        convert list of lists to DataFrame for TransportTable
+        '''
+        #data validity
+        if not all([len(i)-1 == len(inArray[-1]) for i in inArray[:-1]]):
+            raise ValueError("invalid input array")
 
-    def __init__(self,costDF,BFS,RHS,BHS):
+        aggCol  = DataFrame(inArray[-1]).T
+        aggRow  = DataFrame([i[-1] for i in inArray[:-1]])
+        costDF  = DataFrame([i[:-1] for i in inArray[:-1]])
+
+        for i in (costDF,aggCol,aggRow):
+            i.columns = [j+1 for j in i.columns]
+            i.index = [j+1 for j in i.index]
+
+        return cls(costDF,aggCol,aggRow,dict())
+
+    def __init__(self,costDF: DataFrame,aggCol: DataFrame,aggRow: DataFrame,BFS: Dict):
         self.costDF = costDF.copy()
-        self.BFS = BFS  #dict key is coord tuple,   value is assigned val
-        self.BHS = BHS.copy()
-        self.RHS = RHS.copy()
+        self.aggCol = aggCol.copy() # aggregate of Columns
+        self.aggRow = aggRow.copy() # aggregate of Rows
+        self.BFS    = BFS.copy()    #dict key is coord tuple,   value is assigned val
 
-    # table stuff
-    def assign(self,rowIndex,colIndex,amount):  # TODO
-        if (amount <= self.BHS.loc[colIndex]     # amount + col sum
-        and amount <= self.RHS.loc[rowIndex]):   # amount + row sum
+    # LP stuff
+    def to_LP(self,label: str = "X") -> LP:
+        '''
+        return the LP representing this tableau
+        with factors as X_row,col
+        '''
+        def varRepr(row,col,label):
+            return f"{label}_{row},{col}"
 
-            newRHS = self.RHS.copy()
-            newRHS.loc[rowIndex] -= amount
+        # objective Function
+        allVariables = [varRepr(row,col,label) for row in self.costDF.index for col in self.costDF.columns]
+        objFunc = ObjectiveFunction.new("min",
+            *[self.costDF.loc[row,col] for row in self.costDF.index for col in self.costDF.columns],
+            labels=allVariables
+        )
 
-            newBHS = self.BHS.copy()
-            newBHS.loc[colIndex] -= amount
-
-            BFS = self.BFS.copy()
-            BFS[(rowIndex,colIndex)] = amount
-
-            return TransportTable(self.costDF.copy(),BFS, newRHS,newBHS)
-        else:
-            raise ValueError("too large of an assignment") 
-    def assignMax(self,rowIndex,colIndex):
-        amount = min(self.RHS.loc[rowIndex],self.BHS.loc[colIndex])
-        return self.assign(rowIndex,colIndex,amount)
-
-    # LP stuff 
-    def to_LP(self):
-        variablesNo = self.costDF.shape[0]*self.costDF.shape[1]
-        #objectiveFn
-        objFn = ["min"] + list(self.costDF.to_numpy().flatten())
-        signs = [">"] * variablesNo
-        factorNames = []
-        constraints = []
-
-        #row constraints
-        for rowIndex in self.costDF.index:
-            template = [0]*variablesNo + ["=",self.RHS.loc[rowIndex]]
-            for colIndex in self.costDF.columns:
-                factorNames +=[f"X{subscript(rowIndex)},{subscript(colIndex)}"]
-                template[(rowIndex-1)*self.costDF.shape[1] + colIndex-1] = 1
-            constraints.append(template)
+        rowConstraints = [Constraint.new(
+            *[self.costDF.loc[row,col] for row in self.costDF.index],
+            "<",self.aggCol.loc[1,col],
+            labels = [varRepr(row,col,label) for row in self.costDF.index]
+        ) for col in self.costDF.columns]
         
-        #col constraints
-        for colIndex in self.costDF.columns:
-            template = [0]*variablesNo + ["=",self.BHS.loc[colIndex]]
-            for rowIndex in self.costDF.index:       
-                template[(rowIndex-1)*self.costDF.shape[1] + colIndex-1] = 1
-            constraints.append(template)
-        return LP.new(objFn,constraints,signs,factorNames=factorNames)
+        colConstraints = [Constraint.new(
+            *[self.costDF.loc[row,col] for col in self.costDF.columns],
+            "<",self.aggRow.loc[row,1],
+            labels = [varRepr(row,col,label) for col in self.costDF.columns]
+        ) for row in self.costDF.index]
 
-    def to_DualLP(self):
-        baseLP = self.to_LP()
-        factorNames = [f"u{i}" for i in self.costDF.index] + [f"v{i}" for i in self.costDF.columns]
-        return baseLP.getDual(factorNames=factorNames)
+        nonNegConstraints = NonNeg.fromArray(*([">"]*len(allVariables)),labels=allVariables)
 
-    #BFS
-
-    def northWest(self,echo=False,origBHS=False,origRHS=False,curDir="col",checking=(1,1)):
-        #checking is tuple of coordinates
-        if echo == True:
-            self.display()
-        if self.RHS.sum() + self.BHS.sum() == 0:
-            #all assignments done
-            return TransportTable(self.costDF.copy(),self.BFS.copy(),origRHS,origBHS)
-        if type(origBHS) == bool:
-            # only copy on first loop
-            # otherwise pass through orig RHS and BHS
-            origBHS = self.BHS.copy()
-            origRHS = self.RHS.copy()
-        
-        if curDir =="col":
-            nextState = self.assignMax(checking[0],checking[1])
-            rowSum = origRHS.loc[checking[0]]
-            for k,v in  nextState.BFS.items():
-                if k[0] == checking[0]:
-                    rowSum -= v
-            if rowSum == 0:
-                # row Cleared, assign next row
-                return nextState.northWest(echo=echo,origBHS=origBHS,origRHS=origRHS,curDir="row",checking=(checking[0]+1,checking[1]))
-            else:
-                # col uncleared assign next col
-                return nextState.northWest(echo=echo,origBHS=origBHS,origRHS=origRHS,curDir="col",checking=(checking[0],checking[1]+1))
-
-        else: # curDir = "row"
-            # check (checking[0]+1,checking[1])
-            nextState = self.assignMax(checking[0],checking[1])
-            colSum = origBHS.loc[checking[1]]
-            for k,v in  nextState.BFS.items():
-                if k[1] == checking[1]:
-                    colSum -= v
-            if colSum == 0:
-                # col Cleared, assign next col
-                return nextState.northWest(echo=echo,origBHS=origBHS,origRHS=origRHS,curDir="col",checking=(checking[0],checking[1]+1))
-            else:
-                # col uncleared assign next row
-                return nextState.northWest(echo=echo,origBHS=origBHS,origRHS=origRHS,curDir="row",checking=(checking[0]+1,checking[1]))
+        return LP(
+            objFunc,
+            *rowConstraints,
+            *colConstraints,
+            *nonNegConstraints
+            )
     
-    def minimumCost(self,echo=False,prevCost=0,origBHS=False,origRHS=False,crossedOut=[[],[]]):
-        if echo == True:
-            self.display()
-        if self.RHS.sum() + self.BHS.sum() == 0:
-            #all assignment done
-            if len(self.BFS) + 1 == len(self.RHS) + len(self.BHS):
-            # if enough BFS found
-                return TransportTable(self.costDF.copy(),self.BFS.copy(),origRHS,origBHS)
-        if type(origBHS) == bool:
-            # only copy on first loop
-            # otherwise pass through orig RHS and BHS
-            origBHS = self.BHS.copy()
-            origRHS = self.RHS.copy()
+    #BFS stuff
+    def northWest(self,echo: bool=False) -> TransportTable:
+        '''
+        assign a BFS using northWest Method
+        '''
+        def NW(row:int,col:int)-> Dict:
+            '''
+            private recursive function to do allocations
+            '''
+            if echo:
+                df = (assignDF.join(Series(rowAgg, name="remain"))
+                      .append(Series(colAgg, name="remain")).fillna(""))
+                try:
+                    display(df)
+                except:
+                    print(df)
 
-        costs =  np.sort(np.unique(self.costDF.to_numpy().flatten()))
-        filter_arr = costs > prevCost-1
-        costs = costs[filter_arr]
-        # start searching from equal to previous cost
-        for cost in costs:
-            for rowIndex in self.costDF.index:
-                if rowIndex in crossedOut[0]:
-                        continue
-                for colIndex in self.costDF.columns:
-                    if colIndex in crossedOut[1]:
-                        continue
-                    if(self.costDF.loc[rowIndex,colIndex] == cost):
-                        nextState = self.assignMax(rowIndex,colIndex)
-                        
-                        rowSum = origRHS.loc[rowIndex]
-                        colSum = origBHS.loc[colIndex]
-                        for k,v in  nextState.BFS.items():
-                            if k[0] == rowIndex:
-                                rowSum -= v
-                            if k[1] == colIndex:
-                                colSum -= v
-                        #only cross out one row/col
-                        if (rowSum == 0 
-                        and len(self.RHS) - len(crossedOut[0]) > 1):
-                            crossedOut[0].append(rowIndex)
-                        elif (colSum == 0                           # TODO testing if last case assigned is value 0 works
-                        and len(self.BHS)-len(crossedOut[1]) > 1):  # len-len is supposed to not eliminate the last in each dir
-                            crossedOut[1].append(colIndex)
-                        return (nextState.minimumCost(echo=echo,prevCost=cost,origBHS=origBHS,origRHS=origRHS,crossedOut=crossedOut))
-        
-        raise RuntimeWarning("minimum Cost fell through, likely casued by an inbalanced Transport Table")
-    
-    def vogel(self,echo=False,origBHS=False,origRHS=False,crossedOut=[[],[]]):
-        if echo:
-            self.display()
-        if self.RHS.sum() + self.BHS.sum() ==0:
-            #all assignment done
-            if len(self.BFS) + 1 == len(self.RHS) + len(self.BHS):
-                return TransportTable(self.costDF.copy(),self.BFS.copy(),origRHS,origBHS)
-        if type(origBHS) == bool:
-            # only copy on first loop
-            # otherwise pass through orig RHS and BHS
-            origBHS = self.BHS.copy()
-            origRHS = self.RHS.copy()
-        
-        RHSOppCost = Series(dtype=float)
-        for i in self.RHS.index:
-            rowMin = self.costDF.loc[i,:].min()
-            rowMax = self.costDF.loc[i,:].max()
-            rowArr = np.sort(np.unique(self.costDF.loc[i,:]))
-            if (i in crossedOut[0] 
-            or rowMin == rowMax):
-                RHSOppCost = RHSOppCost.append(Series([0],index=[i]))
-            else:
-                RHSOppCost = RHSOppCost.append(Series([rowArr[1] - rowArr[0]],index=[i]))
-
-        BHSOppCost = Series(dtype=float)
-        for i in self.BHS.index:
-            colMin = self.costDF.loc[:,i].min()
-            colMax = self.costDF.loc[:,i].max()
-            colArr = np.sort(np.unique(self.costDF.loc[:,i]))
-            if (i in crossedOut[1] 
-            or colMin == colMax):
-                BHSOppCost = BHSOppCost.append(Series([0],index=[i]))
-            else:
-                BHSOppCost = BHSOppCost.append(Series([colArr[1] - colArr[0]],index=[i]))
-
-        maxCost = RHSOppCost.append(BHSOppCost).max()
-        if maxCost in RHSOppCost.array:
-            for rowIndex,value in RHSOppCost.items():
-                if value == maxCost and rowIndex not in crossedOut[0]:
-                    toSearch = self.costDF.loc[rowIndex].copy()
-                    for i in self.BHS.index:
-                        if i in crossedOut[1]:
-                            toSearch.loc[i] = np.inf
-                    for colIndex in self.BHS.index:
-                        if toSearch.loc[colIndex] == min(toSearch):
-                            nextState = self.assignMax(rowIndex,colIndex)
-                            rowSum = origRHS.loc[rowIndex]
-                            colSum = origBHS.loc[colIndex]
-                            for k,v in  nextState.BFS.items():
-                                if k[0] == rowIndex:
-                                    rowSum -= v
-                                if k[1] == colIndex:
-                                    colSum -= v
-                            #only cross out one row/col
-                            if (rowSum == 0 
-                            and len(self.RHS) - len(crossedOut[0]) > 1):
-                                crossedOut[0].append(rowIndex)
-                            elif (colSum == 0                           # TODO testing if last case assigned is value 0 works
-                            and len(self.BHS)-len(crossedOut[1]) > 1):  # len-len is supposed to not eliminate the last in each dir
-                                crossedOut[1].append(colIndex)
-                            return nextState.vogel(echo=echo,origRHS=origRHS,origBHS=origBHS,crossedOut=crossedOut)
-        else: #maxCost in BHSOppCost
-            for colIndex,value in BHSOppCost.items():
-                if value == maxCost and colIndex not in crossedOut[1]:
-                    toSearch = self.costDF.loc[:,colIndex].copy()
-                    for i in self.RHS.index:
-                        if i in crossedOut[0]:
-                            toSearch.loc[i] = np.inf
-                    for rowIndex in self.RHS.index:
-                        if toSearch.loc[rowIndex] == min(toSearch):
-                            nextState = self.assignMax(rowIndex,colIndex)
-                            rowSum = origRHS.loc[rowIndex]
-                            colSum = origBHS.loc[colIndex]
-                            for k,v in  nextState.BFS.items():
-                                if k[0] == rowIndex:
-                                    rowSum -= v
-                                if k[1] == colIndex:
-                                    colSum -= v
-                            #only cross out one row/col
-                            if (rowSum == 0 
-                            and len(self.RHS) - len(crossedOut[0]) > 1):
-                                crossedOut[0].append(rowIndex)
-                            elif (colSum == 0                           # TODO testing if last case assigned is value 0 works
-                            and len(self.BHS)-len(crossedOut[1]) > 1):  # len-len is supposed to not eliminate the last in each dir
-                                crossedOut[1].append(colIndex)
-                            return nextState.vogel(echo=echo,origRHS=origRHS,origBHS=origBHS,crossedOut=crossedOut)
+            # BFS complete
+            if len(BFS) == len(colAgg) + len(rowAgg) - 1:
+                return None
             
-        raise RuntimeWarning("Vogel fell through, likely casued by an inbalanced Transport Table")
+            # allocate to current checking
+            minVal = min(colAgg.loc[col],rowAgg.loc[row])
+            assignDF.loc[row,col] = minVal
+            BFS[(row,col)] = minVal
+            colAgg.loc[col] -= minVal
+            rowAgg.loc[row] -= minVal
 
-            # colIndex = BHSOppCost.index(maxCost)+1
-            # toSearch = self.costDF.loc[:,colIndex].copy()
-            # for i in self.RHS.index:
-            #     if self.RHS.loc[i] == 0:
-            #         toSearch.loc[i] = np.inf
-            # for i in self.RHS.index:
-            #     if toSearch.loc[i] == min(toSearch):
-            #         return (self.assignMax(i,colIndex)
-            #                     .vogel(echo=echo,origRHS=origRHS,origBHS=origBHS))
+            # go to next
+            if colAgg.loc[col] == 0 and col < len(assignDF.columns):
+                colAgg.loc[col] = "X"
+                return NW(row,col+1 )
+            else: # rowAgg.loc[row] == 0 and row < len(assignDF.index)
+                rowAgg.loc[row] = "X"
+                return NW(row+1,col)
 
-        raise RuntimeWarning("Vogel fell through, likely casued by an inbalanced Transport Table")
+        assignDF = self.costDF.copy().applymap(lambda x:"")
+        colAgg = self.aggCol.copy().loc[1,:]
+        rowAgg = self.aggRow.copy().loc[:,1]
+        BFS = dict()
+        NW(1,1)
+        
+        return TransportTable(self.costDF,self.aggCol,self.aggRow,BFS)
+
+    def minimumCost(self,echo: bool=False) -> TransportTable:
+        '''
+        assign a BFS using minimum cost Method
+        '''
+        def MC():
+            '''
+            private recursive function to do allocations
+            '''
+            if echo:
+                df = (assignDF
+                    .join(Series(rowAgg,name="remain"))
+                    .append(Series(colAgg,name="remain"))
+                    .fillna("")
+                )
+                try:
+                    display(df)
+                except:
+                    print(df)
+
+            if len(BFS) == len(colAgg) + len(rowAgg) - 1:
+                #BFS complete
+                return None
+
+            # find smallest cost
+            row,col = tCostDF[tCostDF == tCostDF.min().min()].stack().index.tolist()[0]
+            
+            
+            # allocate 
+            minVal = min(rowAgg.loc[row],colAgg.loc[col])
+            assignDF.loc[row,col] = minVal
+            BFS[(row,col)] = minVal
+            colAgg.loc[col] -= minVal
+            rowAgg.loc[row] -= minVal
+          
+            # cross out row/col by changing it to np.inf
+            if colAgg.loc[col] == 0:
+                tCostDF.loc[:,col] = np.inf
+                colAgg.loc[col] = "X"
+                return MC()
+            elif rowAgg.loc[row] == 0:
+                tCostDF.loc[row,:] = np.inf
+                rowAgg.loc[row] = "X"
+                return MC()
+
+        tCostDF = self.costDF.copy()
+        assignDF = self.costDF.copy().applymap(lambda x:"")
+        colAgg = self.aggCol.copy().loc[1,:]
+        rowAgg = self.aggRow.copy().loc[:,1]
+        BFS = dict()
+        MC()
+        return TransportTable(self.costDF,self.aggCol,self.aggRow,BFS)
+    
+    def vogel(self,echo: bool=False) -> TransportTable:
+        '''
+        assign a BFS using vogel method
+        '''
+        def oppCost(series:Series) -> float:
+            s = sorted(series)
+            return s[1] - s[0]
+        def VG():
+            '''
+            private recursive function to do allocations
+            '''
+            if echo:
+                df = (assignDF
+                    .join(Series(rowAgg,name="remain"))
+                    .append(Series(colAgg,name="remain"))
+                    .fillna("")
+                )
+                try:
+                    display(df)
+                except:
+                    print(df)
+            
+            if len(BFS) == len(colAgg) + len(rowAgg) - 1:
+                #BFS complete
+                return None
+
+            # select grid to maximise
+            rowOpp = [oppCost(tCostDF.loc[i,:]) if not rowAgg[i]=="X" else 0 for i in rowAgg.index]
+            colOpp = [oppCost(tCostDF.loc[:,i]) if not colAgg[i]=="X" else 0 for i in colAgg.index]
+            maxOpp = max(rowOpp + colOpp)
+            if maxOpp in colOpp:
+                col = colOpp.index(maxOpp) + 1
+                row = tCostDF.loc[:,col].idxmin()
+            else: # maxOpp in rowOpp
+                row = rowOpp.index(maxOpp) + 1
+                col = tCostDF.loc[row,:].idxmin()
+
+            # allocate
+            minVal = min(rowAgg.loc[row],colAgg.loc[col])
+            assignDF.loc[row,col] = minVal
+            BFS[(row,col)] = minVal
+            colAgg.loc[col] -= minVal
+            rowAgg.loc[row] -= minVal
+            
+
+            # cross out the row/col
+            if colAgg.loc[col] == 0:
+                tCostDF.loc[:,col] = np.inf
+                colAgg.loc[col] = "X"
+                return VG()
+            elif rowAgg.loc[row] == 0:
+                tCostDF.loc[row,:] = np.inf
+                rowAgg.loc[row] = "X"
+                return VG()
+
+
+        tCostDF = self.costDF.copy()
+        assignDF = self.costDF.copy().applymap(lambda x:"")
+        rowAgg = self.aggRow.copy().loc[:,1]
+        colAgg = self.aggCol.copy().loc[1,:]
+        BFS = dict()
+        VG()
+        return TransportTable(self.costDF,self.aggCol,self.aggRow,BFS)
 
     # solving
-    def solve(self,echo=False):
+    def getEnteringVar(self,echo=False) -> Tuple[int,int]:
+        '''
+        find the entering var
+        '''
+        variables = [f"U{i}" for i in self.costDF.index]+[f"V{i}" for i in self.costDF.columns]
+        LHS = DataFrame(columns=variables)
+        body = [DataFrame([[1]],columns=[LHS.columns[0]])]
+        body += [DataFrame([[1,1]],columns=[f"U{row}",f"V{col}"]) for (row,col),c in self.BFS.items()]
+        
+        LHS = LHS.append(pd.concat(body,sort=False),sort=False).fillna(0)
+        LHS.index = variables
+        RHS = DataFrame([0]+[self.costDF.loc[row,col] for (row,col),v in self.BFS.items()],columns=["RHS"])
+        RHS.index = variables
+        soln = np.linalg.solve(LHS,RHS)
+        soln = Series([i[0] for i in soln],index=variables)
+        
         if echo:
-            self.display()
-        eV = self.getEnteringVar(echo=echo)
-        if eV == False: # is better to not run the calculation twice
-            return self
-        loop = self.findLoop((eV,),echo=echo)
-        return self.loopPivot(loop,echo=echo).solve(echo=echo)
-    
-    def isOptimal(self):
-        # reuse duality code here
-        return bool(self.getEnteringVar)
+            print("From complementary slackness property:")
+            for i in LHS.index:
+                row = LHS.loc[i]
+                out = "".join([f" + {i}" for i in variables if row[i] == 1]) + f" = {RHS.loc[i,'RHS']}"
+                print(out[3:])
+            print("\nA solution is:")
+            for i in soln.index:
+                print(f"{i} = {soln[i]}")
+            print("\nComputing Ui + Vj – Cij for the nonbasic variables:")
 
-    def getEnteringVar(self,echo=False):
-        # SOLVE FOR U and V
+        enteringVar = (None,0)
+        for row in self.costDF.index:
+            for col in self.costDF.columns:
+                if (row,col) in self.BFS.keys():
+                    continue
+                calc = soln[f"U{row}"] + soln[f"V{col}"] - self.costDF.loc[row,col]
+                if echo:{print(f"U{row} + V{col} - C{row}{col} : X{row}{col} = {calc}")}
+                if calc >= enteringVar[1]:
+                    enteringVar = ((row,col),calc)
+
+        if enteringVar[0] == None:
+            # optimal solution, no complementary slackness
+            raise OptimalException("Optimal Solution, no Entering Variable")
+        if echo:{print(f"\nEntering Variable is X_{row},{col}")}
+        return enteringVar[0]
+
+    def findLoop(self,start: Tuple[int,int],echo=False) -> List[Tuple[int,int]]:
+        '''
+        recursively find _a_ valid closed loop
+        initial path is [(startRow,startCol)]
+        '''
+        def FL(path: Tuple[Tuple[int,int]],axis="col") -> Tuple[Tuple[int,int]]:
+            if ( len(path) > 3 and path[-1] == path[0]):
+                if echo:{print(f"Pivot on loop of {path[:-1]}")}
+                return path[:-1] # drop the repeated start
+
+            prevRow,prevCol = path[-1]
+            if axis == "col":
+                nextSteps = tuple((i,prevCol) for i in self.costDF.index)
+                nextSteps = tuple(i for i in nextSteps if i not in path[1:])
+                nextSteps = tuple(i for i in nextSteps if i in list(self.BFS.keys()) or i == path[0])
+                out =  tuple(FL(path+(i,),axis="row") for i in nextSteps)
+            else: #axis = "row"
+                nextSteps = tuple((prevRow,i) for i in self.costDF.columns)
+                nextSteps = tuple(i for i in nextSteps if i not in path[1:])
+                nextSteps = tuple(i for i in nextSteps if i in list(self.BFS.keys()) or i == path[0])
+                out = tuple(FL(path+(i,),axis="col") for i in nextSteps)
+            out = tuple(i for i in out if i!=None)
+            if len(out) == 1:
+                return out[0]
+            elif len(out) > 1:
+                return out
         
-        matrixRHS = []
-        LHSIndex = Series(self.RHS.index).copy().apply(lambda x:"U" + str(x))
-        LHSIndex = LHSIndex.append(Series(self.BHS.index).copy().apply(lambda x:"V" + str(x)))
-        LHS_Template = Series([0]*len(LHSIndex),index=LHSIndex,dtype=int)
-        matrixLHS = DataFrame(columns=LHSIndex,dtype=int)
+        return FL((start,))
 
-        for k,v in self.BFS.items():
-            LHSrow = LHS_Template.copy()
-            LHSrow.loc["U" + str(k[0])] = 1
-            LHSrow.loc["V" + str(k[1])] = 1
-            matrixLHS = matrixLHS.append(LHSrow,ignore_index=True)
-            matrixRHS += [self.costDF.loc[k[0],k[1]]]
-        matrixRHS = Series(matrixRHS)
-        matrixLHS = matrixLHS.drop(columns=["U1"])
-
-        soln = np.linalg.solve(matrixLHS,matrixRHS)
-        soln = Series(soln,index=matrixLHS.columns)
-        soln = soln.append(Series([0],index=["U1"]))
-        soln = soln[LHSIndex]
-
-
-        basicVarVals = dict()
-        w_dict = dict()
-        for colIndex in self.BHS.index:
-            for rowIndex in self.RHS.index:
-                uVal = soln.loc[f'U{rowIndex}']
-                vVal = soln.loc[f'V{colIndex}']
-                cVal = self.costDF.loc[rowIndex,colIndex]
-
-                uVal = int(uVal) if int(uVal) == uVal else uVal
-                vVal = int(vVal) if int(vVal) == vVal else vVal
-                cVal = int(cVal) if int(cVal) == cVal else cVal
-
-
-                basicVarVals[f"U{subscript(rowIndex)}"] = uVal
-                basicVarVals[f"V{subscript(colIndex)}"] = vVal
-
-                if (rowIndex,colIndex) not in list(self.BFS.keys()):
-                    if echo:
-                        terms = f"U{subscript(rowIndex)} + V{subscript(colIndex)} - C{subscript(rowIndex)},{subscript(colIndex)}"
-                        middle = f" = {uVal} + {vVal} - {cVal}"
-                        calcValue = f" = {uVal + vVal - cVal}"
-                        print(terms + middle + calcValue)
-                    w_dict[rowIndex,colIndex] = soln.loc[f"U{rowIndex}"] + soln.loc[f"V{colIndex}"] - self.costDF.loc[rowIndex,colIndex]
-        if echo:{print(basicVarVals)}
-        maxW = max(w_dict.values())
-        
-        if maxW == 0:
-            if echo:{print(f"all W values are <= 0, optimal solution found\nobjective value is {self.objectiveValue()}\n")}
-            return False
-        
-        for colIndex in [i[1] for i in self.BFS.keys()]:
-            for rowIndex in [i[0] for i in self.BFS.keys()]:
-                if w_dict.get((rowIndex,colIndex)) == maxW:
-                    if echo:{print(f"Entering Variable is {(rowIndex,colIndex)}\n")}
-                    return (rowIndex,colIndex)
-
-    def findLoop(self,path,axis="col",echo=False):
-        # path is a tuple of 
-        # tuples of (row,col)
-        #base case when loop closes
-        if ( len(path) > 3
-        and path[-1] == path[0]):
-            if echo:{print(f"Pivot on loop of {path[:-1]}")}
-            return path[:-1] # drop the repeated start
-        prevRow,prevCol = path[-1]
-
-        if axis == "col":
-            nextSteps = tuple((i,prevCol) for i in self.RHS.index)
-            nextSteps = tuple(i for i in nextSteps if i not in path[1:])
-            nextSteps = tuple(i for i in nextSteps if i in list(self.BFS.keys()) or i == path[0])
-            out =  tuple(self.findLoop(path+(i,),axis="row",echo=echo) for i in nextSteps)
-        else: #axis = "row"
-            nextSteps = tuple((prevRow,i) for i in self.BHS.index)
-            nextSteps = tuple(i for i in nextSteps if i not in path[1:])
-            nextSteps = tuple(i for i in nextSteps if i in list(self.BFS.keys()) or i == path[0])
-            out = tuple(self.findLoop(path+(i,),axis="col",echo=echo) for i in nextSteps)
-
-        out = tuple(i for i in out if i!=None)
-
-        if len(out) == 1:
-            return out[0]
-        elif len(out) > 1:
-            return out
-    
     def loopPivot(self,loopSeq,echo=False):
         '''
-        given that we have somehow found the even and odd squares,
-        now we run the loopPivot on the Transport Table
+        do the Pivot using loopSeq
         '''
-        if echo:{self.display()}
-        evenIndexTuple = ()
-        oddIndexTuple = ()
+        evenCells = ()  # contain tuples of indexes of even cells
+        oddCells = ()   # contain tuples of indexes of odd cells
         i = 0
         while i < len(loopSeq):
-            evenIndexTuple += (loopSeq[i],)
-            oddIndexTuple  += (loopSeq[i+1],)
+            evenCells += (loopSeq[i],)
+            oddCells  += (loopSeq[i+1],)
             i+=2
         newBFS = self.BFS.copy()
         newBFS[loopSeq[0]] = 0
-        # evenIndexTuple is an array of even squares
-        # oddIndexTuple is an array of odd squares
-        # members are tuples of (row,col) similar to x(row,col) notation
-        oddVals = [newBFS[i] for i in oddIndexTuple]
+        oddVals = [newBFS[i] for i in oddCells]
         theta = min(oddVals)
-        leavingVariable = oddIndexTuple[oddVals.index(theta)]       #TODO potential degeneracy when mutiple leaving variables can exist?
+        leavingVariable = oddCells[oddVals.index(theta)]       
+        #TODO potential degeneracy when mutiple leaving variables can exist?
         
-        if echo:{print(f"Leaving Variable is: X{leavingVariable}")}
+        if echo:{print(f"Leaving Variable is: X_{leavingVariable[0]},{leavingVariable[1]}")}
 
-        for i in oddIndexTuple:
+        for i in oddCells:
             newBFS[i] -= theta
-        for i in evenIndexTuple:
+        for i in evenCells:
             newBFS[i] += theta
         del newBFS[leavingVariable]
-        return TransportTable(self.costDF.copy(),newBFS,self.RHS.copy(),self.BHS.copy())
+        return TransportTable(self.costDF,self.aggCol,self.aggRow,newBFS)
+
+    def solve(self,echo: bool=False):
+        '''
+        solve the transport tableau
+        '''
+        newTab = self
+        while True:
+            try:
+                enteringVar = newTab.getEnteringVar(echo=echo)
+            except OptimalException:
+                return newTab
+            loop = newTab.findLoop(enteringVar,echo=echo)
+            newTab = newTab.loopPivot(loop,echo=echo)
+            if echo:{print("-"*20)}
+        #TODO check for degenerate looping
+
+    def isOptimal(self) -> bool:
+        '''
+        check if this is optimal Tableau
+        '''
+        try:
+            self.getEnteringVar()
+        except OptimalException:
+            return True
+        return False
 
     # getters
     def objectiveValue(self):
         '''
         return calculated objective value of this transport tableau using current assignments
         '''
-        dispDF = DataFrame(np.zeros_like(self.costDF),index=self.costDF.index,columns=self.costDF.columns)
-        for k,v in self.BFS.items():
-            dispDF.loc[k[0],k[1]] = v
-        dispDF.insert(dispDF.shape[1],self.RHS.name,self.RHS)
-        return self.costDF.mul(dispDF).sum().sum()
+        return sum([value * self.costDF.loc[row,col] for (row,col),value in self.BFS.items()])
+            
+    def bfsDF(self) -> DataFrame:
+        baseDF = self.costDF.copy().applymap(lambda x:"")
+        for (row,col),value in self.BFS:
+            baseDF.loc[row,col] = value
+        return baseDF
 
-    #display section
-    def displayFormat(self):
-        dispDF = DataFrame(np.zeros_like(self.costDF),index=self.costDF.index,columns=self.costDF.columns)
-        for k,v in self.BFS.items():
-            dispDF.loc[k[0],k[1]] = v
-        dispDF.insert(dispDF.shape[1],self.RHS.name,self.RHS)
-        dispColVars = self.BHS.copy()
-        dispColVars.name = self.BHS.name
-        dispDF = dispDF.append(dispColVars)
-        dispDF = dispDF.applymap(lambda x:"" if np.isnan(x) else x)
-        return dispDF
-    
-    def display(self):
-        displayHelper(self.displayFormat())
-    
     def __repr__(self):
-        return str(self.displayFormat()) + "\n"
+        baseDF = self.costDF.join(Series(self.aggRow.loc[:,1],name="row")).append(Series(self.aggCol.loc[1,:],name="col")).fillna("")
+        b = [f"X_{row},{col} = {c},  " for (row,col),c in self.BFS.items()]
+        b = "".join(b)[:-1]
+        return f"{baseDF}\nBFS : {b}"
