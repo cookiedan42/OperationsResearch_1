@@ -1,4 +1,7 @@
-install using pip? 
+Not fully ready to push to pip    
+On hold as I work my way through readings   
+
+
 
 Completed  
 * LP representations  
@@ -6,18 +9,19 @@ Completed
 * Simplex Tableau
     * TwoPhase Solver
     * BigM solver
-    
-
-Incomplete
-* 2 factor graphing  
-* Common LP problems
-
-TODO 
 * Transport model setup   
     * BFS using northwest  
     * BFS mimimum cost  
     * BFS vogel
 * Transport model solver  
     * loop method  
-    * hungarian method  
-* Network model
+    * hungarian method   
+
+
+Incomplete
+* 2 factor graphing  
+* Common LP problems
+
+TODO 
+
+* Network modelling
